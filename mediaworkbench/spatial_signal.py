@@ -4,31 +4,55 @@ import math
 import sys
 from . import spatial_plan
 
+# Input channel order of the three directional coefficients (x-front, y-left,
+# z-up) for each supported first-order convention. AmbiX is ACN/SN3D
+# [W,Y,Z,X]; FuMa is maxN [W,X,Y,Z].
+_DIRECTION_CHANNELS = {
+    'ambix': (3, 1, 2),
+    'fuma': (1, 2, 3),
+}
+# Output is always ACN/SN3D [W,Y,Z,X].
+_OUTPUT_ORDER = (0, 2, 3, 1)
+
 
 def canonical(frame, convention):
     channels = list(frame)
     if len(channels) != 4:
         raise ValueError('soundfield must have four channels')
+    try:
+        indices = _DIRECTION_CHANNELS[convention]
+    except KeyError:
+        raise ValueError('unsupported soundfield convention')
     pressure = channels[0]
     if convention == 'fuma':
+        # FuMa maxN W carries a sqrt(2) gain over the SN3D omnidirectional term.
         pressure *= math.sqrt(2)
-        indices = (1, 2, 3)
-    elif convention == 'ambix':
-        indices = (1, 2, 3)
-    else:
-        raise ValueError('unsupported soundfield convention')
-    vector = [channels[index] for index in indices]
-    return pressure, vector[0], vector[1], vector[2]
+    x, y, z = (channels[index] for index in indices)
+    return pressure, x, y, z
 
 
 def listener(frame, q):
     w, x, y, z = frame
     a, b, c, d = q
-    # The listener-to-world pose acts inversely on the world soundfield.
+    # First-order soundfield rotation: the listener-to-world pose acts on the
+    # world directional coefficients through the pose's rotation matrix,
+    # expressing world-fixed sources in listener axes (passive field rotation).
     return (w,
         (1-2*(c*c+d*d))*x + 2*(b*c+a*d)*y + 2*(b*d-a*c)*z,
         2*(b*c-a*d)*x + (1-2*(b*b+d*d))*y + 2*(c*d+a*b)*z,
         2*(b*d+a*c)*x + 2*(c*d-a*b)*y + (1-2*(b*b+c*c))*z)
+
+
+def _pose_at(points, sample, cursor):
+    """Evaluate the frozen trajectory at one sample, advancing the segment cursor."""
+    while cursor+1 < len(points) and sample > points[cursor+1]['sample']:
+        cursor += 1
+    left = points[cursor]
+    if cursor+1 == len(points) or sample == left['sample']:
+        return left['q'], cursor
+    right = points[cursor+1]
+    phase = (sample-left['sample'])/(right['sample']-left['sample'])
+    return spatial_plan.slerp(left['q'], right['q'], phase), cursor
 
 
 def transform(plan, pcm, start_sample):
@@ -37,23 +61,20 @@ def transform(plan, pcm, start_sample):
     frames = len(pcm)//4
     if not frames:
         return array('f')
-    finish = min(plan['samples'], start_sample+frames)
-    first = spatial_plan.orientation(plan, start_sample)
-    last = spatial_plan.orientation(plan, finish)
+    finish = start_sample+frames
+    if start_sample < 0 or finish > plan['samples']:
+        raise ValueError('pose outside programme')
+    points = plan['poses']
+    cursor = spatial_plan.segment_index(points, start_sample)
     result = array('f')
+    convention = plan['convention']
     for index in range(frames):
-        source = canonical(pcm[index*4:index*4+4], plan['convention'])
-        beginning = listener(source, first)
-        ending = listener(source, last)
-        fraction = index/frames
-        values = []
-        for previous, following in zip(beginning, ending):
-            values.append(previous+(following-previous)*fraction)
-        w, x, y, z = values
-        if plan['convention'] == 'ambix' and first == [1, 0, 0, 0] and last == first:
-            result.extend(pcm[index*4:index*4+4])
-        else:
-            result.extend((w, y, z, x))
+        sample = start_sample+index
+        q, cursor = _pose_at(points, sample, cursor)
+        source = canonical(pcm[index*4:index*4+4], convention)
+        w, x, y, z = listener(source, q)
+        field = (w, x, y, z)
+        result.extend(field[channel] for channel in _OUTPUT_ORDER)
     return result
 
 

@@ -28,9 +28,9 @@ def write_programme(plan, source, destination, block_frames=1024, start_sample=0
             pcm.frombytes(encoded)
             if sys.byteorder != 'little':
                 pcm.byteswap()
-            block_plan = dict(plan)
-            block_plan['samples'] = min(plan['samples'], count)
-            transformed = spatial_signal.transform(block_plan, pcm, 0)
+            # Keep the global programme clock: every block samples the same
+            # frozen trajectory, so output cannot depend on block partition.
+            transformed = spatial_signal.transform(plan, pcm, written+start_sample)
             if sys.byteorder != 'little':
                 transformed.byteswap()
             output.write(transformed.tobytes())

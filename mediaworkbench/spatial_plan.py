@@ -6,6 +6,12 @@ from . import db, media_sources, timeline
 
 RATE = 48000
 
+# Half-turn roundoff tie, in the absolute dot product between unit quaternions.
+HALF_TURN_EPS = 1e-15
+# Subset choices whose worst error is within this many degrees of the optimum
+# are considered tied, so lexicographic order decides between them.
+ERROR_TIE_DEG = 1e-9
+
 
 def unit(values):
     if len(values) != 4 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
@@ -38,39 +44,129 @@ def poses(keyframes, duration_ms):
     return result
 
 
+def slerp(first, last, phase):
+    """Shortest spherical path at constant angular speed between unit poses."""
+    dot = sum(a*b for a, b in zip(first, last))
+    if dot < 0:
+        # Equivalent orientation, opposite sign: take the short way round.
+        last = [-v for v in last]
+        dot = -dot
+    if dot >= 1.0:
+        return list(first)
+    if abs(dot) <= HALF_TURN_EPS:
+        # Exact half-turn: the canonical endpoint signs fix the rotation plane.
+        angle = math.pi/2
+        sin_angle = 1.0
+    else:
+        dot = min(1.0, max(-1.0, dot))
+        angle = math.acos(dot)
+        sin_angle = math.sin(angle)
+    scale_first = math.sin((1-phase)*angle)/sin_angle
+    scale_last = math.sin(phase*angle)/sin_angle
+    return [a*scale_first + b*scale_last for a, b in zip(first, last)]
+
+
+def segment_index(points, sample):
+    """Index of the left keyframe of the span containing sample on the clock."""
+    if not points[0]['sample'] <= sample <= points[-1]['sample']:
+        raise ValueError('pose outside programme')
+    lo, hi = 0, len(points)-1
+    while hi-lo > 1:
+        mid = (lo+hi)//2
+        if sample < points[mid]['sample']:
+            hi = mid
+        else:
+            lo = mid
+    return lo
+
+
+def segment(points, sample):
+    """Return the (left, right) keyframes straddling sample on the global clock."""
+    lo = segment_index(points, sample)
+    return points[lo], points[min(lo+1, len(points)-1)]
+
+
 def orientation(plan, sample):
     points = plan['poses']
     if not 0 <= sample <= plan['samples']:
         raise ValueError('pose outside programme')
-    selected = None
-    for left, right in zip(points, points[1:]):
-        if sample <= right['sample']:
-            selected = left, right
-            break
-    if selected is None:
+    if sample == points[-1]['sample']:
         return list(points[-1]['q'])
-    left, right = selected
+    left, right = segment(points, sample)
     width = right['sample']-left['sample']
     phase = (sample-left['sample'])/width
-    coefficients = []
-    first = unit(left['q'])
-    last = unit(right['q'])
-    for previous, following in zip(first, last):
-        delta = following-previous
-        coefficients.append(previous+phase*delta)
-    magnitude = sum(value*value for value in coefficients)
-    if magnitude < 1e-20:
-        return list(first)
-    scale = 1/math.sqrt(magnitude)
-    return [value*scale for value in coefficients]
+    return slerp(unit(left['q']), unit(right['q']), phase)
 
 
 def angular_distance(a, b):
-    if sum(x*y for x, y in zip(a, b)) < 0:
-        b = [-value for value in b]
-    difference = math.sqrt(sum((x-y)**2 for x, y in zip(a, b)))
-    together = math.sqrt(sum((x+y)**2 for x, y in zip(a, b)))
-    return 4*math.atan2(difference, together)
+    """Rotation angle (radians) between two poses, independent of quaternion sign."""
+    dot = abs(sum(x*y for x, y in zip(a, b)))
+    norm_a = math.sqrt(sum(x*x for x in a))
+    norm_b = math.sqrt(sum(x*x for x in b))
+    cos_half = dot/(norm_a*norm_b)
+    if cos_half >= 1.0:
+        return 0.0
+    # atan2 keeps the result precise for near-identical poses where acos loses
+    # all accuracy to roundoff.
+    return 2*math.atan2(math.sqrt(max(0.0, 1.0-cos_half*cos_half)), cos_half)
+
+
+def _segment_cost(points, first, last):
+    """Greatest angular error of observations strictly inside one retained span."""
+    if last <= first+1:
+        return 0.0
+    left, right = points[first], points[last]
+    width = right['sample']-left['sample']
+    worst = 0.0
+    for index in range(first+1, last):
+        phase = (points[index]['sample']-left['sample'])/width
+        estimated = slerp(left['q'], right['q'], phase)
+        worst = max(worst, angular_distance(points[index]['q'], estimated))
+    return worst
+
+
+def _cost_table(points):
+    size = len(points)
+    table = [[0.0]*size for _ in range(size)]
+    for first in range(size):
+        for last in range(first+1, size):
+            table[first][last] = _segment_cost(points, first, last)
+    return table
+
+
+def _feasible(cost, max_spans, tolerance):
+    """reachable[k][j]: node j reaches the end using at most k more spans."""
+    size = len(cost)
+    reachable = [[False]*size for _ in range(max_spans+1)]
+    for budget in range(max_spans+1):
+        reachable[budget][size-1] = True      # terminal node needs no span
+    for budget in range(1, max_spans+1):
+        for node in range(size-1):
+            for nxt in range(node+1, size):
+                if cost[node][nxt] <= tolerance and reachable[budget-1][nxt]:
+                    reachable[budget][node] = True
+                    break
+    return reachable
+
+
+def _lexicographic_path(cost, max_spans, tolerance):
+    """Smallest retained-index tuple whose spans all stay within tolerance."""
+    reachable = _feasible(cost, max_spans, tolerance)
+    end = len(cost)-1
+    path = [0]
+    budget = max_spans
+    while path[-1] != end:
+        node = path[-1]
+        chosen = None
+        for nxt in range(node+1, end+1):
+            if cost[node][nxt] <= tolerance and reachable[budget-1][nxt]:
+                chosen = nxt
+                break
+        if chosen is None:
+            raise ValueError('pose compression has no feasible subset')
+        path.append(chosen)
+        budget -= 1
+    return path
 
 
 def compact(points, limit):
@@ -78,27 +174,27 @@ def compact(points, limit):
         raise ValueError('pose capacity must be two to sixty-four')
     if len(points) <= limit:
         return points, 0.0
-    selected = [0, len(points)-1]
-    while len(selected) < limit:
-        best = None
-        for first, last in zip(selected, selected[1:]):
-            segment = {'poses': [points[first], points[last]], 'samples': points[last]['sample']}
-            for index in range(first+1, last):
-                estimated = orientation(segment, points[index]['sample'])
-                deviation = angular_distance(points[index]['q'], estimated)
-                candidate = deviation, -index
-                if best is None or candidate > best[0]:
-                    best = candidate, index
-        if best is None:
-            break
-        selected.append(best[1])
-        selected.sort()
-    maximum = 0.0
-    for first, last in zip(selected, selected[1:]):
-        segment = {'poses': [points[first], points[last]], 'samples': points[last]['sample']}
-        for index in range(first+1, last):
-            maximum = max(maximum, angular_distance(points[index]['q'], orientation(segment, points[index]['sample'])))
-    return [points[index] for index in selected], math.degrees(maximum)
+    # The device accepts `limit` poses, i.e. at most limit-1 interpolated spans.
+    max_spans = limit-1
+    cost = _cost_table(points)
+    size = len(points)
+    # Exact minimax dynamic program. best[k][j] is the smallest achievable
+    # worst span error when node j may use at most k spans to reach the end.
+    best = [[math.inf]*size for _ in range(max_spans+1)]
+    best[0][size-1] = 0.0
+    for budget in range(1, max_spans+1):
+        best[budget][size-1] = 0.0
+        for node in range(size-2, -1, -1):
+            value = math.inf
+            for nxt in range(node+1, size):
+                candidate = max(cost[node][nxt], best[budget-1][nxt])
+                value = min(value, candidate)
+            best[budget][node] = value
+    optimum = best[max_spans][0]
+    tolerance = optimum + math.radians(ERROR_TIE_DEG)
+    indices = _lexicographic_path(cost, max_spans, tolerance)
+    maximum = max(cost[a][b] for a, b in zip(indices, indices[1:]))
+    return [points[index] for index in indices], math.degrees(maximum)
 
 
 def create(conn, project_id, asset_id, start_ms, end_ms, convention, keyframes, max_poses=64):
